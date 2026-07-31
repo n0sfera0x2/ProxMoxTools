@@ -2,24 +2,62 @@
 
 <#
 .SYNOPSIS
-    Prepares a Windows 11 Proxmox VM for conversion into a golden-image template.
+    Prepares a Windows 11 Proxmox VM for conversion into a golden-image
+    template.
 
 .DESCRIPTION
     This script:
+
       - Verifies administrative privileges
       - Creates a transcript log
       - Configures power settings
-      - Installs common tools through WinGet
-      - Installs available Windows updates
-      - Enables OpenSSH and Remote Desktop
-      - Verifies the QEMU Guest Agent
-      - Clears temporary data and event logs
-      - Runs DISM component cleanup
-      - Runs Sysprep with /generalize /oobe /shutdown
+      - Enables Remote Desktop
+      - Optionally configures OpenSSH Server when already installed
+      - Verifies and configures the QEMU Guest Agent
+      - Installs applications through WinGet
+      - Installs Windows updates
+      - Detects pending reboot conditions
+      - Cleans temporary files
+      - Cleans the Windows component store
+      - Optionally clears Windows event logs
+      - Removes PowerShell history
+      - Runs Sysprep with /generalize /oobe /shutdown /mode:vm
+
+.PARAMETER SkipApplications
+    Skips installation and updating of applications through WinGet.
+
+.PARAMETER SkipWindowsUpdate
+    Skips installation of Windows updates.
+
+.PARAMETER SkipOpenSSH
+    Skips all OpenSSH checks and configuration.
+
+.PARAMETER SkipEventLogCleanup
+    Preserves existing Windows event logs.
+
+.PARAMETER ForceSysprep
+    Continues to Sysprep even when Windows reports a pending reboot.
+
+.PARAMETER SkipSysprep
+    Performs image preparation but does not run Sysprep or shut down the VM.
+
+.EXAMPLE
+    .\Prepare-GoldenImage.ps1
+
+.EXAMPLE
+    .\Prepare-GoldenImage.ps1 -SkipOpenSSH
+
+.EXAMPLE
+    .\Prepare-GoldenImage.ps1 -SkipOpenSSH -SkipApplications
+
+.EXAMPLE
+    .\Prepare-GoldenImage.ps1 -SkipSysprep
 
 .NOTES
-    Review the software list before running.
-    The VM will shut down when Sysprep completes.
+    Run from an elevated PowerShell session.
+
+    When Sysprep completes, the VM will shut down. Do not boot the source VM
+    again before converting it into a Proxmox template.
 #>
 
 [CmdletBinding()]
@@ -27,21 +65,29 @@ param(
     [switch]$SkipApplications,
     [switch]$SkipWindowsUpdate,
     [switch]$SkipOpenSSH,
-    [switch]$SkipEventLogCleanup
+    [switch]$SkipEventLogCleanup,
+    [switch]$ForceSysprep,
+    [switch]$SkipSysprep
 )
+
+Set-StrictMode -Version Latest
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $WorkingDirectory = "C:\GoldenImage"
 $LogDirectory = Join-Path $WorkingDirectory "Logs"
-$LogFile = Join-Path $LogDirectory "GoldenImage-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+$Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$LogFile = Join-Path $LogDirectory "GoldenImage-$Timestamp.log"
 
-New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
-Start-Transcript -Path $LogFile -Append
+$TranscriptStarted = $false
+
 
 function Write-Step {
-    param([Parameter(Mandatory)][string]$Message)
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
 
     Write-Host ""
     Write-Host "============================================================"
@@ -49,49 +95,119 @@ function Write-Step {
     Write-Host "============================================================"
 }
 
-function Test-PendingReboot {
-    $locations = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
-        "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+
+function Write-Info {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
     )
 
-    foreach ($location in $locations) {
-        if (Test-Path $location) {
-            if ($location -like "*Session Manager") {
-                $value = Get-ItemProperty `
-                    -Path $location `
-                    -Name PendingFileRenameOperations `
-                    -ErrorAction SilentlyContinue
+    Write-Host "[INFO] $Message"
+}
 
-                if ($null -ne $value) {
-                    return $true
-                }
-            }
-            else {
-                return $true
-            }
+
+function Write-Success {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    Write-Host "[SUCCESS] $Message"
+}
+
+
+function Stop-GoldenImageTranscript {
+    if ($script:TranscriptStarted) {
+        try {
+            Stop-Transcript | Out-Null
         }
+        catch {
+            # Ignore transcript shutdown errors.
+        }
+
+        $script:TranscriptStarted = $false
+    }
+}
+
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+    $principal = New-Object `
+        Security.Principal.WindowsPrincipal($identity)
+
+    return $principal.IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+}
+
+
+function Test-PendingReboot {
+    $rebootRequiredPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+        "HKLM:\SOFTWARE\Microsoft\Updates\UpdateExeVolatile"
+    )
+
+    foreach ($path in $rebootRequiredPaths) {
+        if (Test-Path $path) {
+            return $true
+        }
+    }
+
+    $sessionManagerPath =
+        "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+
+    $pendingFileRename = Get-ItemProperty `
+        -Path $sessionManagerPath `
+        -Name "PendingFileRenameOperations" `
+        -ErrorAction SilentlyContinue
+
+    if ($null -ne $pendingFileRename) {
+        return $true
+    }
+
+    try {
+        $computerSystem = Invoke-CimMethod `
+            -Namespace "root\ccm\ClientSDK" `
+            -ClassName "CCM_ClientUtilities" `
+            -MethodName "DetermineIfRebootPending" `
+            -ErrorAction Stop
+
+        if (
+            $computerSystem.RebootPending -or
+            $computerSystem.IsHardRebootPending
+        ) {
+            return $true
+        }
+    }
+    catch {
+        # SCCM client namespace is normally not present on unmanaged systems.
     }
 
     return $false
 }
 
+
 function Install-WingetPackage {
     param(
-        [Parameter(Mandatory)][string]$Id,
-        [Parameter(Mandatory)][string]$Name
+        [Parameter(Mandatory)]
+        [string]$Id,
+
+        [Parameter(Mandatory)]
+        [string]$Name
     )
 
-    Write-Host "Installing $Name..."
+    Write-Info "Installing $Name..."
 
     $arguments = @(
-        "install",
-        "--id", $Id,
-        "--exact",
-        "--silent",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
+        "install"
+        "--id"
+        $Id
+        "--exact"
+        "--silent"
+        "--accept-package-agreements"
+        "--accept-source-agreements"
         "--disable-interactivity"
     )
 
@@ -102,60 +218,559 @@ function Install-WingetPackage {
         -PassThru `
         -NoNewWindow
 
-    if ($process.ExitCode -notin @(0, -1978335189)) {
-        Write-Warning "$Name returned exit code $($process.ExitCode)."
+    $acceptedExitCodes = @(
+        0,
+        -1978335189
+    )
+
+    if ($process.ExitCode -in $acceptedExitCodes) {
+        Write-Success "$Name installation completed."
+    }
+    else {
+        Write-Warning (
+            "$Name returned WinGet exit code " +
+            "$($process.ExitCode)."
+        )
     }
 }
 
-function Install-WindowsUpdates {
+
+function Install-GoldenImageWindowsUpdates {
     Write-Step "Installing Windows updates"
 
-    if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-
-        Install-PackageProvider `
+    try {
+        $nugetProvider = Get-PackageProvider `
             -Name NuGet `
-            -MinimumVersion 2.8.5.201 `
-            -Force
+            -ErrorAction SilentlyContinue
 
-        Install-Module `
-            -Name PSWindowsUpdate `
-            -Scope AllUsers `
-            -Force `
-            -Confirm:$false
+        if (-not $nugetProvider) {
+            Write-Info "Installing the NuGet package provider."
+
+            Install-PackageProvider `
+                -Name NuGet `
+                -MinimumVersion "2.8.5.201" `
+                -Force `
+                -Confirm:$false |
+                Out-Null
+        }
+
+        $repository = Get-PSRepository `
+            -Name PSGallery `
+            -ErrorAction SilentlyContinue
+
+        if ($repository) {
+            Set-PSRepository `
+                -Name PSGallery `
+                -InstallationPolicy Trusted
+        }
+
+        if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+            Write-Info "Installing the PSWindowsUpdate module."
+
+            Install-Module `
+                -Name PSWindowsUpdate `
+                -Scope AllUsers `
+                -Force `
+                -AllowClobber `
+                -Confirm:$false
+        }
+
+        Import-Module PSWindowsUpdate -Force
+
+        Write-Info "Checking Microsoft Update for available updates."
+
+        Get-WindowsUpdate `
+            -MicrosoftUpdate `
+            -AcceptAll `
+            -Install `
+            -IgnoreReboot `
+            -Verbose
     }
-
-    Import-Module PSWindowsUpdate
-
-    Get-WindowsUpdate `
-        -MicrosoftUpdate `
-        -AcceptAll `
-        -Install `
-        -IgnoreReboot
+    catch {
+        Write-Warning (
+            "Windows Update encountered an error: " +
+            $_.Exception.Message
+        )
+    }
 }
 
-try {
-    Write-Step "Starting Windows 11 golden-image preparation"
 
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+function Configure-OpenSSH {
+    Write-Step "Checking OpenSSH Server"
 
-    if (-not $principal.IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator
-    )) {
-        throw "This script must be run as Administrator."
+    $capabilityName = "OpenSSH.Server~~~~0.0.1.0"
+
+    try {
+        $capability = Get-WindowsCapability `
+            -Online `
+            -Name $capabilityName `
+            -ErrorAction Stop
+    }
+    catch {
+        Write-Warning (
+            "Unable to query the OpenSSH capability: " +
+            $_.Exception.Message
+        )
+
+        return
     }
 
-    Write-Host "Computer: $env:COMPUTERNAME"
-    Write-Host "Windows version: $((Get-CimInstance Win32_OperatingSystem).Caption)"
-    Write-Host "Build: $((Get-CimInstance Win32_OperatingSystem).BuildNumber)"
+    if ($capability.State -ne "Installed") {
+        Write-Warning @"
+OpenSSH Server is not currently installed.
 
-    Write-Step "Disabling sleep and hibernation"
+The script will not automatically install it because
+Add-WindowsCapability can stall while waiting for Windows Update.
 
-    powercfg.exe /hibernate off
-    powercfg.exe /change monitor-timeout-ac 0
-    powercfg.exe /change standby-timeout-ac 0
-    powercfg.exe /change disk-timeout-ac 0
+To install it later, use:
+
+    Settings
+    > System
+    > Optional features
+    > View features
+    > OpenSSH Server
+
+Or run this command manually after Windows Update is healthy:
+
+    Add-WindowsCapability -Online `
+        -Name OpenSSH.Server~~~~0.0.1.0
+
+To skip this check entirely, run the script with:
+
+    -SkipOpenSSH
+"@
+
+        return
+    }
+
+    $sshService = Get-Service `
+        -Name "sshd" `
+        -ErrorAction SilentlyContinue
+
+    if (-not $sshService) {
+        Write-Warning (
+            "OpenSSH is marked as installed, but the sshd service " +
+            "was not found."
+        )
+
+        return
+    }
+
+    Set-Service `
+        -Name "sshd" `
+        -StartupType Automatic
+
+    if ($sshService.Status -ne "Running") {
+        try {
+            Start-Service -Name "sshd" -ErrorAction Stop
+        }
+        catch {
+            Write-Warning (
+                "The sshd service could not be started: " +
+                $_.Exception.Message
+            )
+        }
+    }
+
+    $firewallRule = Get-NetFirewallRule `
+        -Name "OpenSSH-Server-In-TCP" `
+        -ErrorAction SilentlyContinue
+
+    if (-not $firewallRule) {
+        New-NetFirewallRule `
+            -Name "OpenSSH-Server-In-TCP" `
+            -DisplayName "OpenSSH Server (sshd)" `
+            -Enabled True `
+            -Direction Inbound `
+            -Protocol TCP `
+            -Action Allow `
+            -LocalPort 22 |
+            Out-Null
+    }
+    else {
+        Enable-NetFirewallRule `
+            -Name "OpenSSH-Server-In-TCP" `
+            -ErrorAction SilentlyContinue
+    }
+
+    Write-Success "OpenSSH Server is configured."
+}
+
+
+function Configure-QemuGuestAgent {
+    Write-Step "Checking QEMU Guest Agent"
+
+    $possibleServiceNames = @(
+        "QEMU-GA",
+        "qemu-ga"
+    )
+
+    $qemuService = $null
+
+    foreach ($serviceName in $possibleServiceNames) {
+        $qemuService = Get-Service `
+            -Name $serviceName `
+            -ErrorAction SilentlyContinue
+
+        if ($qemuService) {
+            break
+        }
+    }
+
+    if (-not $qemuService) {
+        Write-Warning @"
+QEMU Guest Agent was not detected.
+
+Mount the VirtIO ISO and run:
+
+    virtio-win-guest-tools.exe
+
+Then rerun this script before converting the VM into a template.
+"@
+
+        return
+    }
+
+    Set-Service `
+        -Name $qemuService.Name `
+        -StartupType Automatic
+
+    if ($qemuService.Status -ne "Running") {
+        try {
+            Start-Service `
+                -Name $qemuService.Name `
+                -ErrorAction Stop
+        }
+        catch {
+            Write-Warning (
+                "The QEMU Guest Agent could not be started: " +
+                $_.Exception.Message
+            )
+        }
+    }
+
+    $qemuService = Get-Service -Name $qemuService.Name
+
+    Write-Info "QEMU Guest Agent service: $($qemuService.Name)"
+    Write-Info "QEMU Guest Agent state: $($qemuService.Status)"
+    Write-Success "QEMU Guest Agent configuration completed."
+}
+
+
+function Install-GoldenImageApplications {
+    Write-Step "Installing applications"
+
+    $wingetCommand = Get-Command `
+        "winget.exe" `
+        -ErrorAction SilentlyContinue
+
+    if (-not $wingetCommand) {
+        Write-Warning @"
+WinGet is not available.
+
+Application installation will be skipped. WinGet is normally installed
+through the Microsoft App Installer package.
+"@
+
+        return
+    }
+
+    try {
+        winget.exe source update `
+            --disable-interactivity |
+            Out-Host
+    }
+    catch {
+        Write-Warning (
+            "WinGet source update failed: " +
+            $_.Exception.Message
+        )
+    }
+
+    $packages = @(
+        @{
+            Id   = "7zip.7zip"
+            Name = "7-Zip"
+        },
+        @{
+            Id   = "Git.Git"
+            Name = "Git"
+        },
+        @{
+            Id   = "Microsoft.PowerShell"
+            Name = "PowerShell 7"
+        },
+        @{
+            Id   = "Microsoft.Sysinternals"
+            Name = "Sysinternals Suite"
+        },
+        @{
+            Id   = "Microsoft.VisualStudioCode"
+            Name = "Visual Studio Code"
+        },
+        @{
+            Id   = "Mozilla.Firefox"
+            Name = "Firefox"
+        },
+        @{
+            Id   = "Python.Python.3.13"
+            Name = "Python 3.13"
+        }
+    )
+
+    foreach ($package in $packages) {
+        try {
+            Install-WingetPackage `
+                -Id $package.Id `
+                -Name $package.Name
+        }
+        catch {
+            Write-Warning (
+                "Could not install $($package.Name): " +
+                $_.Exception.Message
+            )
+        }
+    }
+
+    Write-Step "Applying available WinGet application upgrades"
+
+    try {
+        $upgradeArguments = @(
+            "upgrade"
+            "--all"
+            "--silent"
+            "--accept-package-agreements"
+            "--accept-source-agreements"
+            "--disable-interactivity"
+        )
+
+        $upgradeProcess = Start-Process `
+            -FilePath "winget.exe" `
+            -ArgumentList $upgradeArguments `
+            -Wait `
+            -PassThru `
+            -NoNewWindow
+
+        if ($upgradeProcess.ExitCode -ne 0) {
+            Write-Warning (
+                "WinGet upgrade returned exit code " +
+                "$($upgradeProcess.ExitCode)."
+            )
+        }
+    }
+    catch {
+        Write-Warning (
+            "WinGet upgrade encountered an error: " +
+            $_.Exception.Message
+        )
+    }
+}
+
+
+function Remove-TemporaryData {
+    Write-Step "Cleaning temporary data"
+
+    $temporaryLocations = @(
+        "$env:TEMP\*",
+        "$env:LOCALAPPDATA\Temp\*",
+        "C:\Windows\Temp\*",
+        "C:\Windows\SoftwareDistribution\Download\*"
+    )
+
+    foreach ($location in $temporaryLocations) {
+        Write-Info "Cleaning $location"
+
+        Remove-Item `
+            -Path $location `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+
+    try {
+        Clear-RecycleBin `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+    catch {
+        # Recycle Bin may not be initialized for every profile.
+    }
+
+    Write-Success "Temporary file cleanup completed."
+}
+
+
+function Clear-GoldenImageEventLogs {
+    Write-Step "Clearing Windows event logs"
+
+    $eventLogs = wevtutil.exe el
+
+    foreach ($eventLog in $eventLogs) {
+        try {
+            wevtutil.exe cl "$eventLog" 2>$null
+        }
+        catch {
+            # Some protected or active logs may not allow clearing.
+        }
+    }
+
+    Write-Success "Event log cleanup completed."
+}
+
+
+function Remove-ShellHistory {
+    Write-Step "Removing PowerShell and shell history"
+
+    try {
+        $historyPath = (Get-PSReadLineOption).HistorySavePath
+
+        if ($historyPath) {
+            Remove-Item `
+                -Path $historyPath `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        # PSReadLine may not be loaded.
+    }
+
+    $historyLocations = @(
+        "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt",
+        "$env:APPDATA\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt"
+    )
+
+    foreach ($historyLocation in $historyLocations) {
+        Remove-Item `
+            -Path $historyLocation `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+
+    Clear-History -ErrorAction SilentlyContinue
+
+    Write-Success "Shell history cleanup completed."
+}
+
+
+function Invoke-ComponentCleanup {
+    Write-Step "Cleaning the Windows component store"
+
+    $dismArguments = @(
+        "/Online"
+        "/Cleanup-Image"
+        "/StartComponentCleanup"
+    )
+
+    $dismProcess = Start-Process `
+        -FilePath "dism.exe" `
+        -ArgumentList $dismArguments `
+        -Wait `
+        -PassThru `
+        -NoNewWindow
+
+    if ($dismProcess.ExitCode -eq 0) {
+        Write-Success "DISM component cleanup completed."
+    }
+    else {
+        Write-Warning (
+            "DISM returned exit code " +
+            "$($dismProcess.ExitCode)."
+        )
+    }
+}
+
+
+function Invoke-GoldenImageSysprep {
+    Write-Step "Running Sysprep"
+
+    $sysprepPath = Join-Path `
+        $env:WINDIR `
+        "System32\Sysprep\Sysprep.exe"
+
+    if (-not (Test-Path $sysprepPath)) {
+        throw "Sysprep was not found at $sysprepPath."
+    }
+
+    Write-Warning @"
+Sysprep is about to generalize and shut down this VM.
+
+After the VM powers off:
+
+  1. Do not start the source VM again.
+  2. Detach the Windows and VirtIO installation ISOs.
+  3. Convert the VM into a Proxmox template.
+"@
+
+    $confirmation = Read-Host `
+        "Type SYSPREP to continue"
+
+    if ($confirmation -cne "SYSPREP") {
+        throw "Sysprep was cancelled by the user."
+    }
+
+    Stop-GoldenImageTranscript
+
+    $sysprepArguments = @(
+        "/generalize"
+        "/oobe"
+        "/shutdown"
+        "/mode:vm"
+    )
+
+    $sysprepProcess = Start-Process `
+        -FilePath $sysprepPath `
+        -ArgumentList $sysprepArguments `
+        -Wait `
+        -PassThru
+
+    if ($sysprepProcess.ExitCode -ne 0) {
+        throw (
+            "Sysprep returned exit code " +
+            "$($sysprepProcess.ExitCode). Review " +
+            "C:\Windows\System32\Sysprep\Panther\setuperr.log."
+        )
+    }
+}
+
+
+try {
+    if (-not (Test-IsAdministrator)) {
+        throw "This script must be run from an elevated PowerShell session."
+    }
+
+    New-Item `
+        -Path $LogDirectory `
+        -ItemType Directory `
+        -Force |
+        Out-Null
+
+    Start-Transcript `
+        -Path $LogFile `
+        -Append |
+        Out-Null
+
+    $TranscriptStarted = $true
+
+    Write-Step "Starting Windows 11 golden-image preparation"
+
+    $operatingSystem = Get-CimInstance `
+        -ClassName Win32_OperatingSystem
+
+    Write-Info "Computer name: $env:COMPUTERNAME"
+    Write-Info "Windows edition: $($operatingSystem.Caption)"
+    Write-Info "Windows version: $($operatingSystem.Version)"
+    Write-Info "Windows build: $($operatingSystem.BuildNumber)"
+    Write-Info "Log file: $LogFile"
+
+    Write-Step "Configuring power settings"
+
+    powercfg.exe /hibernate off | Out-Null
+    powercfg.exe /change monitor-timeout-ac 0 | Out-Null
+    powercfg.exe /change standby-timeout-ac 0 | Out-Null
+    powercfg.exe /change disk-timeout-ac 0 | Out-Null
+
+    Write-Success "Sleep and hibernation are disabled."
 
     Write-Step "Configuring Remote Desktop"
 
@@ -164,227 +779,123 @@ try {
         -Name "fDenyTSConnections" `
         -Value 0
 
-    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-
-    if (-not $SkipOpenSSH) {
-        Write-Step "Installing and configuring OpenSSH Server"
-
-        $sshCapability = Get-WindowsCapability -Online |
-            Where-Object Name -Like "OpenSSH.Server*"
-
-        if ($sshCapability.State -ne "Installed") {
-            Add-WindowsCapability `
-                -Online `
-                -Name $sshCapability.Name |
-                Out-Null
-        }
-
-        Set-Service sshd -StartupType Automatic
-        Start-Service sshd
-
-        if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule `
-                -Name "OpenSSH-Server-In-TCP" `
-                -DisplayName "OpenSSH Server (sshd)" `
-                -Enabled True `
-                -Direction Inbound `
-                -Protocol TCP `
-                -Action Allow `
-                -LocalPort 22
-        }
-    }
-
-    Write-Step "Checking QEMU Guest Agent"
-
-    $qemuService = Get-Service `
-        -Name "QEMU-GA" `
+    Enable-NetFirewallRule `
+        -DisplayGroup "Remote Desktop" `
         -ErrorAction SilentlyContinue
 
-    if ($qemuService) {
-        Set-Service -Name $qemuService.Name -StartupType Automatic
+    Write-Success "Remote Desktop is enabled."
 
-        if ($qemuService.Status -ne "Running") {
-            Start-Service -Name $qemuService.Name
-        }
-
-        Write-Host "QEMU Guest Agent is installed and running."
+    if ($SkipOpenSSH) {
+        Write-Step "Skipping OpenSSH configuration"
+        Write-Info "OpenSSH was skipped because -SkipOpenSSH was specified."
     }
     else {
+        Configure-OpenSSH
+    }
+
+    Configure-QemuGuestAgent
+
+    if ($SkipApplications) {
+        Write-Step "Skipping application installation"
+        Write-Info (
+            "Application installation was skipped because " +
+            "-SkipApplications was specified."
+        )
+    }
+    else {
+        Install-GoldenImageApplications
+    }
+
+    if ($SkipWindowsUpdate) {
+        Write-Step "Skipping Windows Update"
+        Write-Info (
+            "Windows Update was skipped because " +
+            "-SkipWindowsUpdate was specified."
+        )
+    }
+    else {
+        Install-GoldenImageWindowsUpdates
+    }
+
+    $pendingReboot = Test-PendingReboot
+
+    if ($pendingReboot) {
         Write-Warning @"
-QEMU Guest Agent was not detected.
+Windows reports that a reboot is pending.
 
-Mount the VirtIO ISO and run:
-    virtio-win-guest-tools.exe
+The recommended process is:
 
-Then rerun this script before creating the template.
-"@
-    }
+  1. Stop this run.
+  2. Restart Windows.
+  3. Sign back in.
+  4. Run this script again with:
 
-    if (-not $SkipApplications) {
-        Write-Step "Installing applications"
+     -SkipOpenSSH -SkipApplications
 
-        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-
-        if (-not $winget) {
-            Write-Warning "WinGet is unavailable. Skipping application installation."
-        }
-        else {
-            $packages = @(
-                @{
-                    Id   = "7zip.7zip"
-                    Name = "7-Zip"
-                },
-                @{
-                    Id   = "Git.Git"
-                    Name = "Git"
-                },
-                @{
-                    Id   = "Microsoft.PowerShell"
-                    Name = "PowerShell 7"
-                },
-                @{
-                    Id   = "Microsoft.Sysinternals"
-                    Name = "Sysinternals Suite"
-                },
-                @{
-                    Id   = "Microsoft.VisualStudioCode"
-                    Name = "Visual Studio Code"
-                },
-                @{
-                    Id   = "Mozilla.Firefox"
-                    Name = "Firefox"
-                },
-                @{
-                    Id   = "Python.Python.3.13"
-                    Name = "Python"
-                }
-            )
-
-            foreach ($package in $packages) {
-                try {
-                    Install-WingetPackage `
-                        -Id $package.Id `
-                        -Name $package.Name
-                }
-                catch {
-                    Write-Warning "Could not install $($package.Name): $($_.Exception.Message)"
-                }
-            }
-
-            Write-Host "Applying available WinGet upgrades..."
-
-            winget.exe upgrade `
-                --all `
-                --silent `
-                --accept-package-agreements `
-                --accept-source-agreements `
-                --disable-interactivity
-        }
-    }
-
-    if (-not $SkipWindowsUpdate) {
-        try {
-            Install-WindowsUpdates
-        }
-        catch {
-            Write-Warning "Windows Update encountered an error: $($_.Exception.Message)"
-        }
-    }
-
-    if (Test-PendingReboot) {
-        Write-Warning @"
-A reboot is pending.
-
-For the cleanest image, reboot Windows, sign back in, and run this script again.
-Use -SkipApplications on the second run to avoid reinstalling applications.
+This allows pending servicing operations to finish before Sysprep.
 "@
 
-        $response = Read-Host "Continue to Sysprep despite the pending reboot? Type YES to continue"
+        if (-not $ForceSysprep) {
+            throw @"
+A pending reboot was detected. The script stopped before cleanup and Sysprep.
 
-        if ($response -ne "YES") {
-            throw "Stopped because Windows requires a reboot."
+Restart Windows and rerun the script, or use -ForceSysprep to override this
+safety check.
+"@
         }
+
+        Write-Warning (
+            "Continuing despite a pending reboot because " +
+            "-ForceSysprep was specified."
+        )
     }
 
-    Write-Step "Cleaning temporary data"
+    Remove-TemporaryData
 
-    $temporaryLocations = @(
-        "$env:TEMP\*",
-        "C:\Windows\Temp\*",
-        "C:\Windows\SoftwareDistribution\Download\*"
-    )
+    Invoke-ComponentCleanup
 
-    foreach ($location in $temporaryLocations) {
-        Remove-Item `
-            -Path $location `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
+    if ($SkipEventLogCleanup) {
+        Write-Step "Skipping event log cleanup"
+        Write-Info (
+            "Windows event logs were preserved because " +
+            "-SkipEventLogCleanup was specified."
+        )
+    }
+    else {
+        Clear-GoldenImageEventLogs
     }
 
-    Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+    Remove-ShellHistory
 
-    Write-Step "Cleaning Windows component store"
+    if ($SkipSysprep) {
+        Write-Step "Skipping Sysprep"
 
-    $dism = Start-Process `
-        -FilePath "dism.exe" `
-        -ArgumentList @(
-            "/Online",
-            "/Cleanup-Image",
-            "/StartComponentCleanup"
-        ) `
-        -Wait `
-        -PassThru `
-        -NoNewWindow
+        Write-Success @"
+Golden-image preparation completed without Sysprep.
 
-    if ($dism.ExitCode -ne 0) {
-        Write-Warning "DISM returned exit code $($dism.ExitCode)."
+Review the system, then rerun this script when ready to generalize the VM.
+"@
+
+        Stop-GoldenImageTranscript
+        exit 0
     }
 
-    if (-not $SkipEventLogCleanup) {
-        Write-Step "Clearing Windows event logs"
-
-        wevtutil.exe el |
-            ForEach-Object {
-                wevtutil.exe cl $_ 2>$null
-            }
-    }
-
-    Write-Step "Removing shell and PowerShell history"
-
-    Remove-Item `
-        -Path (Get-PSReadLineOption).HistorySavePath `
-        -Force `
-        -ErrorAction SilentlyContinue
-
-    Remove-Item `
-        -Path "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" `
-        -Force `
-        -ErrorAction SilentlyContinue
-
-    Write-Step "Running Sysprep"
-
-    Write-Host "The VM will shut down when Sysprep finishes."
-    Write-Host "Do not start this source VM again before converting it to a template."
-
-    Stop-Transcript
-
-    $sysprep = "$env:WINDIR\System32\Sysprep\Sysprep.exe"
-
-    Start-Process `
-        -FilePath $sysprep `
-        -ArgumentList @(
-            "/generalize",
-            "/oobe",
-            "/shutdown",
-            "/mode:vm"
-        ) `
-        -Wait
+    Invoke-GoldenImageSysprep
 
     exit 0
 }
 catch {
-    Write-Error $_
-    Stop-Transcript -ErrorAction SilentlyContinue
+    Write-Host ""
+    Write-Error $_.Exception.Message
+
+    if ($TranscriptStarted) {
+        Write-Host "Review the transcript log at:"
+        Write-Host $LogFile
+    }
+
+    Stop-GoldenImageTranscript
     exit 1
+}
+finally {
+    Stop-GoldenImageTranscript
 }
